@@ -213,5 +213,6 @@ class ContractOut(BaseModel):
     clientEmail: Optional[str] = None
     createdAt: datetime
     signedAt: Optional[datetime] = None
+    pdf_url: Optional[str] = None
 
     model_config = {"populate_by_name": True}

@@ -800,6 +800,27 @@ async function downloadSignedContract(contractId, buttonEl = null) {
   }
 
   try {
+    // Prefer using the contract record's `pdf_url` when available so the
+    // browser can directly open the Cloudinary URL (avoids proxying binary
+    // through the API and avoids CORS/blob issues).
+    const metaRes = await authFetch(`${API_BASE}/contracts/${contractId}`);
+    if (!metaRes.ok) throw new Error('Failed to fetch contract metadata');
+    const meta = await metaRes.json();
+    const pdfUrl = meta.pdf_url;
+    if (pdfUrl && typeof pdfUrl === 'string' && pdfUrl.toLowerCase().startsWith('http')) {
+      const anchor = document.createElement('a');
+      anchor.href = pdfUrl;
+      anchor.target = '_blank';
+      anchor.rel = 'noopener noreferrer';
+      anchor.download = `contract_${contractId}.pdf`;
+      anchor.style.display = 'none';
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      return;
+    }
+
+    // Fallback: stream download from the API endpoint (legacy/local files)
     const res = await authFetch(`${API_BASE}/contracts/${contractId}/download`);
     if (!res.ok) {
       throw new Error('Download request failed');

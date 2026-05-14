@@ -17,6 +17,7 @@ from slowapi.errors import RateLimitExceeded
 from fastapi.responses import JSONResponse
 
 from app.core.config import ALLOWED_ORIGINS, DATABASE_NAME
+from app.core.cloudinary_client import configure_cloudinary
 from app.db.mongo import (
     close_mongo_connection,
     ensure_mongo_ready,
@@ -104,7 +105,9 @@ async def add_security_headers(request, call_next):
 @app.on_event("startup")
 async def ensure_indexes():
     """Create required database indexes on startup (idempotent)."""
-    print(f"[startup] Mongo target DB: {DATABASE_NAME}")
+    logger.info("[startup] Mongo target DB: %s", DATABASE_NAME)
+    # Configure Cloudinary (no-op if not configured)
+    configure_cloudinary()
     await ensure_mongo_ready()
 
     # Users

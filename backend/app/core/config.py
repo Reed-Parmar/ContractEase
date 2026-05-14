@@ -54,3 +54,25 @@ ALLOWED_ORIGINS = [
 # Server settings
 HOST = os.getenv("HOST", "0.0.0.0")
 PORT = int(os.getenv("PORT", "8000"))
+
+# Cloudinary configuration (optional)
+CLOUDINARY_CLOUD_NAME = os.getenv("CLOUDINARY_CLOUD_NAME")
+CLOUDINARY_API_KEY = os.getenv("CLOUDINARY_API_KEY")
+CLOUDINARY_API_SECRET = os.getenv("CLOUDINARY_API_SECRET")
+CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
+
+# Base folder in Cloudinary to store uploaded PDFs
+CLOUDINARY_PDF_FOLDER = os.getenv("CLOUDINARY_PDF_FOLDER", "contractease/pdfs")
+
+# MongoTLS and startup tuning
+# If set to '1' or 'true' (case-insensitive) the client will allow invalid
+# TLS certificates. This should only be used for local development.
+MONGO_TLS_ALLOW_INVALID_CERTS = str(os.getenv("MONGO_TLS_ALLOW_INVALID_CERTS", "false")).strip().lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# Startup retry behaviour when ping fails (useful for transient network issues)
+MONGO_STARTUP_RETRY_COUNT = int(os.getenv("MONGO_STARTUP_RETRY_COUNT", "3"))
+MONGO_STARTUP_RETRY_DELAY_MS = int(os.getenv("MONGO_STARTUP_RETRY_DELAY_MS", "1000"))

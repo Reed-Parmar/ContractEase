@@ -13,10 +13,11 @@ import re
 from pathlib import Path
 import sys
 from typing import Optional
+from urllib.request import urlopen
 
 from bson import ObjectId
 from fastapi import HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
 from pymongo import ReturnDocument
 
 from app.core.auth import get_current_actor
@@ -28,7 +29,6 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.append(str(REPO_ROOT))
 
 from pdf_gen_engine import generate_contract_pdf
-from pdf_gen_engine.config import PDF_STORAGE_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +81,15 @@ def _parse_datetime(value):
         except ValueError:
             continue
     return None
+
+
+def _is_http_url(value: object) -> bool:
+    return isinstance(value, str) and value.strip().lower().startswith(("http://", "https://"))
+
+
+def _fetch_remote_pdf_bytes(pdf_url: str) -> bytes:
+    with urlopen(pdf_url, timeout=30) as response:
+        return response.read()
 
 
 def _serialize(doc: dict) -> dict:
@@ -469,6 +478,7 @@ async def _attach_sender_fields(doc: dict) -> dict:
 
 
 async def _generate_legacy_pdf_path(contract_id: str, doc: dict) -> str:
+    logger.info("Regeneration fallback triggered for contract %s", contract_id)
     signature_doc = await signatures_collection.find_one(
         {
             "$or": [
@@ -483,7 +493,17 @@ async def _generate_legacy_pdf_path(contract_id: str, doc: dict) -> str:
     doc = await _attach_sender_fields(doc)
 
     try:
-        pdf_path = await asyncio.to_thread(generate_contract_pdf, _build_pdf_payload(doc, signature_doc))
+        # Generate PDF bytes and upload to Cloudinary so legacy callers receive a URL
+        pdf_bytes = await asyncio.to_thread(generate_contract_pdf, _build_pdf_payload(doc, signature_doc), "bytes")
+        from app.services.storage_service import upload_pdf_bytes
+
+        upload_result = await asyncio.to_thread(
+            upload_pdf_bytes, pdf_bytes, None, f"contractease/pdfs/{contract_id}"
+        )
+        pdf_path = upload_result.get("secure_url") or upload_result.get("url")
+        pdf_public_id = upload_result.get("public_id")
+        if not pdf_path:
+            raise RuntimeError("Cloudinary did not return a URL for uploaded legacy PDF")
     except ValueError as error:
         logger.warning("Legacy PDF validation failed for contract %s: %s", contract_id, error)
         raise HTTPException(status_code=400, detail=str(error)) from error
@@ -491,7 +511,14 @@ async def _generate_legacy_pdf_path(contract_id: str, doc: dict) -> str:
         logger.exception("Legacy PDF generation failed for contract %s", contract_id)
         raise HTTPException(status_code=500, detail="Failed to generate signed contract PDF.") from error
 
-    await contracts_collection.update_one({"_id": doc["_id"]}, {"$set": {"pdf_path": pdf_path}})
+    # Persist both the modern `pdf_url` and the legacy `pdf_path` for compatibility.
+    update_result = await contracts_collection.update_one(
+        {"_id": doc["_id"]}, {"$set": {"pdf_path": pdf_path, "pdf_url": pdf_path}}
+    )
+    if update_result.matched_count == 0:
+        raise HTTPException(status_code=500, detail="Failed to persist regenerated PDF URL")
+
+    logger.info("Regeneration fallback completed for contract %s", contract_id)
     return pdf_path
 
 
@@ -599,10 +626,14 @@ async def get_contract(contract_id: str, actor: dict) -> dict:
         raise HTTPException(status_code=403, detail="You do not have access to this contract")
 
     doc = await _attach_sender_fields(doc)
+    if doc.get("status") == ContractStatus.signed.value and not _is_http_url(doc.get("pdf_url")):
+        pdf_url = await _generate_legacy_pdf_path(contract_id, doc)
+        doc["pdf_url"] = pdf_url
+        doc["pdf_path"] = pdf_url
     return _serialize(doc)
 
 
-async def download_contract_pdf(contract_id: str, actor: dict) -> FileResponse:
+async def download_contract_pdf(contract_id: str, actor: dict) -> Response:
     contract_oid = _validate_object_id(contract_id, "contract")
     requester_id = str(actor.get("sub") or "")
     requester_oid = _validate_object_id(requester_id, "authenticated user")
@@ -614,29 +645,30 @@ async def download_contract_pdf(contract_id: str, actor: dict) -> FileResponse:
     if not _is_contract_owner(doc, requester_oid, requester_id):
         raise HTTPException(status_code=403, detail="You do not have access to this contract")
 
-    pdf_path_value = doc.get("pdf_path")
-    if not pdf_path_value and doc.get("status") == ContractStatus.signed.value:
-        pdf_path_value = await _generate_legacy_pdf_path(contract_id, doc)
+    pdf_url_value = doc.get("pdf_url")
+    if not _is_http_url(pdf_url_value):
+        if doc.get("status") != ContractStatus.signed.value:
+            raise HTTPException(status_code=404, detail="Signed PDF not available for this contract")
 
-    if not pdf_path_value:
+        pdf_url_value = await _generate_legacy_pdf_path(contract_id, doc)
+        doc["pdf_url"] = pdf_url_value
+        doc["pdf_path"] = pdf_url_value
+
+    if not _is_http_url(pdf_url_value):
         raise HTTPException(status_code=404, detail="Signed PDF not available for this contract")
 
-    storage_root = PDF_STORAGE_PATH.resolve()
-    pdf_path = Path(str(pdf_path_value))
-    if not pdf_path.is_absolute():
-        pdf_path = (storage_root / pdf_path).resolve()
-    else:
-        pdf_path = pdf_path.resolve()
-
     try:
-        pdf_path.relative_to(storage_root)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail="Stored PDF path is invalid") from exc
+        pdf_bytes = await asyncio.to_thread(_fetch_remote_pdf_bytes, pdf_url_value)
+    except Exception as exc:
+        logger.exception("Failed to fetch signed PDF bytes for contract %s from %s", contract_id, pdf_url_value)
+        raise HTTPException(status_code=502, detail="Failed to retrieve signed contract PDF") from exc
 
-    if not pdf_path.exists():
-        raise HTTPException(status_code=404, detail="Signed PDF file is missing")
-
-    return FileResponse(str(pdf_path), media_type="application/pdf", filename=f"contract_{contract_id}.pdf")
+    logger.info("Served contract PDF for %s via Cloudinary", contract_id)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="contract_{contract_id}.pdf"'},
+    )
 
 
 async def update_contract(contract_id: str, payload: ContractCreate, actor: dict) -> dict:

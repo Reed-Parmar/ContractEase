@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 import logging
-from pathlib import Path
 
 from bson import ObjectId
 from fastapi import HTTPException
@@ -69,13 +68,6 @@ async def cleanup_stale_pending_contracts(now: datetime | None = None) -> int:
                         {"pendingAt": None},
                     ]
                 },
-                {
-                    "$or": [
-                        {"pdf_path": {"$exists": False}},
-                        {"pdf_path": None},
-                        {"pdf_path": ""},
-                    ]
-                },
             ],
         },
         {
@@ -119,26 +111,16 @@ async def sign_contract(contract_id: str, payload: SignatureCreate, actor: dict)
 
     signed_at = datetime.now(timezone.utc)
     stale_before = signed_at - PENDING_LOCK_TTL
+    logger.info("Signing started for contract %s", contract_id)
     await cleanup_stale_pending_contracts(signed_at)
 
     locked_contract = await contracts_collection.find_one_and_update(
         {
             "_id": oid,
             "clientId": actor_oid,
-            "$and": [
-                {
-                    "$or": [
-                        {"status": ContractStatus.sent.value},
-                        {"status": ContractStatus.pending.value, "pendingAt": {"$lte": stale_before}},
-                    ]
-                },
-                {
-                    "$or": [
-                        {"pdf_path": {"$exists": False}},
-                        {"pdf_path": None},
-                        {"pdf_path": ""},
-                    ]
-                },
+            "$or": [
+                {"status": ContractStatus.sent.value},
+                {"status": ContractStatus.pending.value, "pendingAt": {"$lte": stale_before}},
             ],
         },
         {
@@ -159,7 +141,7 @@ async def sign_contract(contract_id: str, payload: SignatureCreate, actor: dict)
         if not str(existing_signatures.get("creator") or "").strip():
             raise HTTPException(status_code=400, detail="Creator signature is missing from this contract")
 
-        if existing.get("status") == ContractStatus.signed.value and existing.get("pdf_path"):
+        if existing.get("status") == ContractStatus.signed.value:
             raise HTTPException(status_code=400, detail="Contract is already signed")
 
         if existing.get("status") == ContractStatus.pending.value:
@@ -175,6 +157,14 @@ async def sign_contract(contract_id: str, payload: SignatureCreate, actor: dict)
             {"$set": {"status": ContractStatus.sent.value, "signedAt": None, "pendingAt": None}},
         )
         raise HTTPException(status_code=403, detail="Signer does not match assigned client")
+
+    signature_fields = locked_contract.get("signatures") or {}
+    if not str(signature_fields.get("creator") or "").strip():
+        await contracts_collection.update_one(
+            {"_id": oid},
+            {"$set": {"status": ContractStatus.sent.value, "signedAt": None, "pendingAt": None}},
+        )
+        raise HTTPException(status_code=400, detail="Creator signature is missing from this contract")
 
     sig_doc = {
         "contractId": oid,
@@ -193,15 +183,6 @@ async def sign_contract(contract_id: str, payload: SignatureCreate, actor: dict)
         house_sale = ((locked_contract.get("templateData") or {}).get("houseSale") or {})
         if house_sale.get("sale_price") is not None:
             amount_value = house_sale.get("sale_price")
-    signature_fields = locked_contract.get("signatures") or {}
-
-    if not str(signature_fields.get("creator") or "").strip():
-        await signatures_collection.delete_one({"_id": result.inserted_id})
-        await contracts_collection.update_one(
-            {"_id": oid},
-            {"$set": {"status": ContractStatus.sent.value, "signedAt": None, "pendingAt": None}},
-        )
-        raise HTTPException(status_code=400, detail="Creator signature is missing from this contract")
 
     contract_payload = {
         "type": contract_type if contract_type in SUPPORTED_CONTRACT_TYPES else "",
@@ -229,7 +210,30 @@ async def sign_contract(contract_id: str, payload: SignatureCreate, actor: dict)
                 status_code=500,
                 detail="PDF generator unavailable; ensure pdf_gen_engine is installed and importable",
             ) from import_error
-        pdf_path = await asyncio.to_thread(generate_contract_pdf, contract_payload)
+
+        # Generate PDF bytes off the event loop and upload to Cloudinary
+        logger.info("PDF generation started for signed contract %s", contract_id)
+        pdf_bytes = await asyncio.to_thread(generate_contract_pdf, contract_payload, "bytes")
+        try:
+            from app.services.storage_service import upload_pdf_bytes
+
+            logger.info("Cloudinary upload started for signed contract %s", contract_id)
+            upload_result = await asyncio.to_thread(
+                upload_pdf_bytes, pdf_bytes, None, f"contractease/pdfs/{contract_id}"
+            )
+            pdf_url = upload_result.get("secure_url") or upload_result.get("url")
+            pdf_public_id = upload_result.get("public_id")
+            if not pdf_url:
+                raise RuntimeError("Cloudinary did not return a secure URL for uploaded PDF")
+            logger.info("Cloudinary upload completed for signed contract %s", contract_id)
+        except Exception as upload_error:
+            logger.exception("PDF upload failed for signed contract %s: %s", contract_id, upload_error)
+            await signatures_collection.delete_one({"_id": result.inserted_id})
+            await contracts_collection.update_one(
+                {"_id": oid},
+                {"$set": {"status": ContractStatus.sent.value, "signedAt": None, "pendingAt": None}},
+            )
+            raise HTTPException(status_code=500, detail="Failed to upload signed contract PDF.") from upload_error
     except ValueError as error:
         logger.warning("PDF validation failed for signed contract %s: %s", contract_id, error)
         await signatures_collection.delete_one({"_id": result.inserted_id})
@@ -255,7 +259,9 @@ async def sign_contract(contract_id: str, payload: SignatureCreate, actor: dict)
                     "status": ContractStatus.signed.value,
                     "signedAt": signed_at,
                     "pendingAt": None,
-                    "pdf_path": pdf_path,
+                    # Persist both `pdf_url` and legacy `pdf_path` for compatibility
+                    "pdf_url": pdf_url,
+                    "pdf_path": pdf_url,
                     "signatures.client": payload.signatureImage,
                 }
             },
@@ -266,11 +272,18 @@ async def sign_contract(contract_id: str, payload: SignatureCreate, actor: dict)
         logger.exception("Failed to persist signed contract state for %s", contract_id)
 
         try:
-            pdf_file = Path(str(pdf_path))
-            if pdf_file.exists():
-                await asyncio.to_thread(pdf_file.unlink)
+            # Attempt to remove uploaded file from Cloudinary when possible
+            if "pdf_public_id" in locals() and pdf_public_id:
+                try:
+                    import cloudinary.uploader
+
+                    await asyncio.to_thread(
+                        cloudinary.uploader.destroy, pdf_public_id, resource_type="raw"
+                    )
+                except Exception:
+                    logger.exception("Failed to destroy uploaded Cloudinary PDF during rollback for %s", contract_id)
         except Exception:
-            logger.exception("Failed to delete generated PDF during rollback for %s", contract_id)
+            logger.exception("Unexpected error during rollback cleanup for %s", contract_id)
 
         await signatures_collection.delete_one({"_id": result.inserted_id})
         await contracts_collection.update_one(
@@ -281,6 +294,7 @@ async def sign_contract(contract_id: str, payload: SignatureCreate, actor: dict)
 
     sig_doc["_id"] = str(result.inserted_id)
     sig_doc["contractId"] = str(sig_doc["contractId"])
+    logger.info("Signing completed for contract %s", contract_id)
     return sig_doc
 
 
