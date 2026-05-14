@@ -16,7 +16,7 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from fastapi.responses import JSONResponse
 
-from app.core.config import ALLOWED_ORIGINS, DATABASE_NAME
+from app.core.config import DATABASE_NAME
 from app.core.cloudinary_client import configure_cloudinary
 from app.db.mongo import (
     close_mongo_connection,
@@ -37,6 +37,21 @@ app = FastAPI(
 )
 app.state.limiter = limiter
 logger = logging.getLogger(__name__)
+
+origins = [
+    "http://localhost:5500",
+    "http://127.0.0.1:5500",
+    "https://contract-ease-1.vercel.app",
+]
+
+# CORS must be registered once, immediately after app creation, before routes.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -63,16 +78,6 @@ async def response_validation_exception_handler(request, exc):
         status_code=500,
         content={"detail": "Internal server error"},
     )
-
-# ── CORS — restrict to specific allowed origins ──────────────
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=ALLOWED_ORIGINS,
-    allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 
 @app.middleware("http")
 async def log_requests(request, call_next):
