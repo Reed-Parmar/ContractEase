@@ -2,8 +2,8 @@
 MongoDB connection manager using Motor (async driver).
 
 Improvements:
-- Reads TLS and startup tuning options from app.core.config
-- Emits detailed diagnostics about resolved hosts and connection mode
+- Uses production-safe Atlas TLS defaults
+- Emits sanitized startup diagnostics about connection mode and retry settings
 - Performs a small retry loop during startup ping to tolerate transient issues
 - Uses a single shared AsyncIOMotorClient instance
 """
@@ -26,7 +26,6 @@ from app.core.config import (
     MONGO_MAX_POOL_SIZE,
     MONGO_MIN_POOL_SIZE,
     MONGO_MAX_IDLE_TIME_MS,
-    MONGO_TLS_ALLOW_INVALID_CERTS,
     MONGO_STARTUP_RETRY_COUNT,
     MONGO_STARTUP_RETRY_DELAY_MS,
 )
@@ -45,12 +44,8 @@ def _build_client_options() -> dict[str, Any]:
         "maxIdleTimeMS": int(MONGO_MAX_IDLE_TIME_MS),
     }
 
-    # TLS: be explicit. Only relax invalid cert validation when explicitly
-    # configured for local development via MONGO_TLS_ALLOW_INVALID_CERTS.
+    # Atlas and Render both expect TLS; keep the client on the secure default.
     opts["tls"] = True
-    if MONGO_TLS_ALLOW_INVALID_CERTS:
-        logger.warning("MONGO_TLS_ALLOW_INVALID_CERTS is enabled — only use this for development")
-        opts["tlsAllowInvalidCertificates"] = True
 
     return opts
 
@@ -58,7 +53,17 @@ def _build_client_options() -> dict[str, Any]:
 # Create a single shared AsyncIOMotorClient instance.
 # Motor/pymongo will lazily connect; options above control behaviour.
 _client_opts = _build_client_options()
-logger.debug("Initializing Mongo client with opts: %s", {k: v for k, v in _client_opts.items() if k != "tlsAllowInvalidCertificates"})
+logger.info(
+    "Initializing Mongo client: mode=%s tls=%s serverSelectionTimeoutMS=%s connectTimeoutMS=%s socketTimeoutMS=%s maxPoolSize=%s minPoolSize=%s maxIdleTimeMS=%s",
+    "SRV" if MONGO_URI.strip().lower().startswith("mongodb+srv:") else "STANDARD",
+    _client_opts.get("tls", False),
+    _client_opts["serverSelectionTimeoutMS"],
+    _client_opts["connectTimeoutMS"],
+    _client_opts["socketTimeoutMS"],
+    _client_opts["maxPoolSize"],
+    _client_opts["minPoolSize"],
+    _client_opts["maxIdleTimeMS"],
+)
 client = AsyncIOMotorClient(MONGO_URI, **_client_opts)
 
 # Database handle
@@ -74,19 +79,28 @@ async def ensure_mongo_ready() -> None:
     """Ping MongoDB during startup to fail fast with actionable logs.
 
     Retries a small number of times to tolerate transient network/TLS glitches.
-    Detailed diagnostics are logged to help root-cause TLS handshakes.
+    Detailed diagnostics are logged to help root-cause Atlas connectivity issues.
     """
     attempt = 0
     last_exc: Exception | None = None
-    # Log basic runtime diagnostics
-    try:
-        is_srv = MONGO_URI.strip().lower().startswith("mongodb+srv:")
-    except Exception:
-        is_srv = False
+    is_srv = MONGO_URI.strip().lower().startswith("mongodb+srv:")
 
-    logger.info("MongoDB URI mode: %s", "SRV" if is_srv else "STANDARD")
-    logger.info("Mongo client options: serverSelectionTimeoutMS=%s connectTimeoutMS=%s socketTimeoutMS=%s",
-                MONGO_SERVER_SELECTION_TIMEOUT_MS, MONGO_CONNECT_TIMEOUT_MS, MONGO_SOCKET_TIMEOUT_MS)
+    logger.info(
+        "Mongo startup: env=MONGO_URI present mode=%s database=%s retryCount=%s retryDelayMs=%s",
+        "SRV" if is_srv else "STANDARD",
+        DATABASE_NAME,
+        MONGO_STARTUP_RETRY_COUNT,
+        MONGO_STARTUP_RETRY_DELAY_MS,
+    )
+    logger.info(
+        "Mongo timeouts: serverSelectionTimeoutMS=%s connectTimeoutMS=%s socketTimeoutMS=%s maxPoolSize=%s minPoolSize=%s maxIdleTimeMS=%s",
+        MONGO_SERVER_SELECTION_TIMEOUT_MS,
+        MONGO_CONNECT_TIMEOUT_MS,
+        MONGO_SOCKET_TIMEOUT_MS,
+        MONGO_MAX_POOL_SIZE,
+        MONGO_MIN_POOL_SIZE,
+        MONGO_MAX_IDLE_TIME_MS,
+    )
 
     # Try ping with limited retries
     for attempt in range(1, max(1, int(MONGO_STARTUP_RETRY_COUNT)) + 1):
@@ -95,22 +109,14 @@ async def ensure_mongo_ready() -> None:
             # Trigger server selection and handshake
             await client.admin.command("ping")
 
-            # Log resolved nodes for diagnostics
-            try:
-                nodes = getattr(client, "nodes", None)
-                if nodes:
-                    logger.info("Resolved MongoDB nodes: %s", ",".join([f"{h}:{p}" for (h, p) in nodes]))
-            except Exception:
-                logger.debug("Unable to enumerate MongoDB nodes for diagnostics")
-
-            logger.info("MongoDB ping successful")
+            logger.info("MongoDB connection established successfully")
             return
         except ServerSelectionTimeoutError as sse:
             last_exc = sse
-            logger.warning("MongoDB server selection timed out (attempt %d/%d): %s", attempt, MONGO_STARTUP_RETRY_COUNT, sse)
+            logger.warning("MongoDB server selection timed out (attempt %d/%d)", attempt, MONGO_STARTUP_RETRY_COUNT)
         except Exception as exc:
             last_exc = exc
-            logger.exception("MongoDB ping failed (attempt %d/%d): %s", attempt, MONGO_STARTUP_RETRY_COUNT, exc)
+            logger.exception("MongoDB ping failed (attempt %d/%d)", attempt, MONGO_STARTUP_RETRY_COUNT)
 
         if attempt < MONGO_STARTUP_RETRY_COUNT:
             delay = int(MONGO_STARTUP_RETRY_DELAY_MS) / 1000.0

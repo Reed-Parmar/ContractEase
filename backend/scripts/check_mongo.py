@@ -9,7 +9,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name
 logger = logging.getLogger("check_mongo")
 
 print("Loaded .env MONGO_URI:", config.MONGO_URI)
-print("MONGO_TLS_ALLOW_INVALID_CERTS:", config.MONGO_TLS_ALLOW_INVALID_CERTS)
 print("MONGO_STARTUP_RETRY_COUNT:", config.MONGO_STARTUP_RETRY_COUNT)
 
 async def main():

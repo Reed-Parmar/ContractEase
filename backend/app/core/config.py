@@ -18,8 +18,15 @@ load_dotenv(_PROJECT_ROOT / ".env", override=False)
 load_dotenv(_BACKEND_ROOT / ".env", override=False)
 
 
+def _required_env(name: str) -> str:
+    value = os.getenv(name)
+    if not value or not value.strip():
+        raise RuntimeError(f"{name} must be set before backend startup")
+    return value.strip()
+
+
 # MongoDB connection string
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
+MONGO_URI = _required_env("MONGO_URI")
 
 # Database name
 DATABASE_NAME = (
@@ -63,15 +70,6 @@ CLOUDINARY_URL = os.getenv("CLOUDINARY_URL")
 
 # Base folder in Cloudinary to store uploaded PDFs
 CLOUDINARY_PDF_FOLDER = os.getenv("CLOUDINARY_PDF_FOLDER", "contractease/pdfs")
-
-# MongoTLS and startup tuning
-# If set to '1' or 'true' (case-insensitive) the client will allow invalid
-# TLS certificates. This should only be used for local development.
-MONGO_TLS_ALLOW_INVALID_CERTS = str(os.getenv("MONGO_TLS_ALLOW_INVALID_CERTS", "false")).strip().lower() in (
-    "1",
-    "true",
-    "yes",
-)
 
 # Startup retry behaviour when ping fails (useful for transient network issues)
 MONGO_STARTUP_RETRY_COUNT = int(os.getenv("MONGO_STARTUP_RETRY_COUNT", "3"))
